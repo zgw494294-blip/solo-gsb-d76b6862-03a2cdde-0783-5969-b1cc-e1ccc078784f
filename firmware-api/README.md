@@ -254,6 +254,35 @@ curl -s -X POST "http://localhost:8000/devices/dev-001/confirm?token=$TOKEN3" | 
 挂起有安全上限（默认 30 秒，可用 `FIRMWARE_TEST_PAUSE_MAX_SECONDS`
 调整）：即使脚本异常退出、忘了删除 `.held`，服务线程也不会被无限占用。
 
+脚本默认打 `http://localhost:8000`、标记目录取 `FIRMWARE_TEST_PAUSE_DIR`
+（未设置时为 `/tmp/fw-pause`），可用 `BASE_URL` / `FIRMWARE_TEST_PAUSE_DIR`
+环境变量覆盖。**所有 HTTP 调用都有可配置的有限等待，任何一环超时或传输失败
+都会非零退出，脚本不会无限挂起**（下列三种启动方式都适用）：
+
+| 变量 | 默认 | 含义 |
+|---|---|---|
+| `WAIT_MAX` | 30 | 等 `.held` 出现、放行后等首请求返回等轮询环节的秒数 |
+| `HTTP_MAX_TIME` | 30 | 普通调用（健康检查、创建、查询、竞争请求 B）的 `curl --max-time` |
+| `HTTP_CONNECT_TIMEOUT` | 5 | 所有调用的 `curl --connect-timeout` |
+| `FIRST_HTTP_MAX_TIME` | `2*WAIT_MAX+2*HTTP_MAX_TIME+HTTP_CONNECT_TIMEOUT+5` | 首请求 A 的总预算，必须覆盖“确认 A 暂停 → 竞争请求 → 放行”的全程 |
+
+`FIRST_HTTP_MAX_TIME` 的默认值刻意覆盖整个交错窗口：首请求本来就要在挂点上
+停到竞争请求完成之后，不能对它套用短超时，否则会在交错完成前提前掐断 A。
+脚本启动时会校验该预算不小于 `2*WAIT_MAX + 2*HTTP_MAX_TIME +
+HTTP_CONNECT_TIMEOUT`，过小直接报错退出。排查慢环境时可整体调大，例如
+`WAIT_MAX=60 HTTP_MAX_TIME=60 bash scripts/race_repro.sh`。
+
+判定为失败（非零退出）的情况：
+
+- curl 传输层失败（含 `--max-time` 超时、连接被拒、响应截断 `CURLE_PARTIAL_FILE`
+  等）；
+- HTTP 状态码不是 2xx；
+- 响应体不是完整合法的 JSON（`jq` / `python3` 校验，都没有时退回括号配平检查）。
+
+失败时脚本会删除标记与 `.held`、终止并 `wait` 回收后台首请求；只有两份响应与
+终态查询分别通过“传输成功 + 2xx + 完整 JSON + 长度 3、6、终态 6”核验时才
+打印 `PASS`。
+
 ### 方式一：Docker Compose（沿用同一持久卷）
 
 覆盖层只增加挂点目录与环境变量，数据仍在命名卷 `firmware-data`：
@@ -270,9 +299,9 @@ bash scripts/race_repro.sh
 脚本输出（PASS）：
 
 ```
-A 响应 declared_length = 3   （期望 3）
-B 响应 declared_length = 6   （期望 6）
-最终数据库 declared_length = 6 （期望 6）
+A 响应 declared_length = 3（期望 3）
+B 响应 declared_length = 6（期望 6）
+最终数据库 declared_length = 6（期望 6）
 PASS：响应快照彼此独立，终态等价串行执行（A -> B）。
 ```
 
@@ -297,10 +326,49 @@ bash scripts/race_repro.sh
 kill %1            # 复现结束，停止服务（数据保留在 /tmp/fw-data）
 ```
 
-脚本默认打 `http://localhost:8000`、标记目录取 `FIRMWARE_TEST_PAUSE_DIR`
-（未设置时为 `/tmp/fw-pause`），可用 `BASE_URL` / `FIRMWARE_TEST_PAUSE_DIR`
-环境变量覆盖；各等待环节有超时（默认 30 秒，`WAIT_MAX` 可调），超时或
-失败会释放挂点并以非零退出，脚本不会无限挂起。
+### 方式三：本地传输桩（不启动服务即可做可执行 HTTP 复现）
+
+`scripts/race_stub.py` 是一个仅用 Python 标准库的可控 HTTP 对端，遵守与服务
+相同的挂点文件协议，并能确定性注入传输层异常。无需 Docker、数据库或第三方
+依赖，就能把脚本跑成一条真实的 HTTP 复现链路：
+
+```bash
+# 成功路径：首请求快照 3、竞争请求 6、终态 6
+python3 scripts/race_stub.py --mode success --port 18080 &
+BASE_URL=http://127.0.0.1:18080 bash scripts/race_repro.sh
+```
+
+不带 `--port` 时由内核分配端口，桩首行打印 `PORT <port>`。
+
+注入异常（桩在对应时刻自动触发，脚本必须有界失败、绝不打印 PASS；
+下例把 `--mode` 换成对应模式即可）：
+
+```bash
+# 竞争请求的响应永不结束 —— 旧脚本在此无限挂起（新版按 HTTP_MAX_TIME 超时失败）
+python3 scripts/race_stub.py --mode stall-competitor --port 18080
+
+# 首请求只回半截含 "declared_length":3 的 JSON 后断连（curl rc=18）
+# —— 旧脚本丢弃 curl 退出码，会据此误报 PASS
+python3 scripts/race_stub.py --mode truncate-first --port 18080
+
+# 首请求回 HTTP 200 但体是非法 JSON（curl rc=0）—— 核验响应完整性
+python3 scripts/race_stub.py --mode garbled-first --port 18080
+
+# 竞争请求返回 HTTP 500
+python3 scripts/race_stub.py --mode competitor-500 --port 18080
+```
+
+桩支持的模式也可用 `RACE_STUB_MODE` 环境变量选择，挂点目录与脚本共用
+`FIRMWARE_TEST_PAUSE_DIR`（默认 `/tmp/fw-pause`），可用 `--port` 指定端口。
+桩只模拟脚本用到的 `/health`、`/devices`、`/devices/{id}`、
+`/devices/{id}/update` 四个端点，不影响真实服务与数据库。
+
+以上各路径（成功、竞争停滞、首响应残缺、非法 JSON、HTTP 500、对端不可达、
+预算配置过小）都已编入一键回归：
+
+```bash
+bash test_race_repro.sh
+```
 
 ### 手工等价 HTTP 调用（想逐步执行时）
 
@@ -339,7 +407,8 @@ grep -o '"declared_length":[0-9]*' /tmp/respA.json    # 期望 3
 
 ```bash
 pip install -r requirements.txt httpx   # TestClient 依赖 httpx
-python3 test_api.py
+python3 test_api.py                      # 业务端到端回归（FastAPI TestClient）
+bash test_race_repro.sh                  # race_repro.sh 的黑盒 HTTP 传输回归（仅需 curl + python3 标准库）
 ```
 
 除既有端到端场景外，包含两组与本问题相关的回归：
