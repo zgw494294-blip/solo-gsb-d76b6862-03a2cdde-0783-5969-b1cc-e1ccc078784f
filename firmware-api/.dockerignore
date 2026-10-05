@@ -4,4 +4,5 @@ __pycache__/
 *.db-wal
 *.db-shm
 test_api.py
+test_race_repro.py
 .git/
